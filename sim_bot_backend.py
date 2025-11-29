@@ -4,37 +4,34 @@ import time
 from datetime import datetime
 from typing import Dict, List, Optional
 
-import ccxt
-from fastapi import FastAPI
+import requests
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
 # ==========================
-# GENEL AYARLAR
+# COINGECKO AYARLARI
 # ==========================
 
-# ccxt'de desteklenen herhangi bir borsa:
-# "binance", "bybit", "okx", "kucoin", ...
-EXCHANGE_ID = "binance"
+COINGECKO_BASE_URL = "https://api.coingecko.com/api/v3"
 
-# Sadece public endpoint kullanıyoruz -> API key YOK
-exchange_class = getattr(ccxt, EXCHANGE_ID)
-exchange = exchange_class({"enableRateLimit": True})
-
-app = FastAPI(title="Sim Trading Bot Backend (Paper Trading)", version="1.0.0")
+app = FastAPI(
+    title="Sim Trading Bot Backend (CoinGecko, No API Key)",
+    version="1.0.0"
+)
 
 
 # ==========================
-# VERİ MODELİ
+# VERİ MODELLERİ
 # ==========================
 
 class BotConfig(BaseModel):
-    symbol: str = Field("BTC/USDT", description="İşlem yapılacak parite (ör: BTC/USDT)")
-    start_usdt: float = Field(1000.0, description="Başlangıç USDT bakiyesi")
+    symbol: str = Field("BTC/USDT", description="İşlem yapılacak parite (BTC/USDT, BTCUSDT, BTC vs.)")
+    start_usdt: float = Field(1000.0, description="Başlangıç USDT (USD) bakiyesi")
     grid_width_pct: float = Field(0.05, description="Merkez fiyatın +/- yüzdesi (örn: 0.05 = %5)")
     num_grids: int = Field(10, description="Grid basamak sayısı")
     usdt_per_order: float = Field(50.0, description="Her seviyede kullanılacak USDT miktarı")
-    take_profit_pct: float = Field(0.006, description="Her işlem için kâr marjı (örn: 0.006 = %0.6)")
-    stop_loss_pct: float = Field(0.01, description="Her işlem için zarar kesme oranı (örn: 0.01 = %1)")
+    take_profit_pct: float = Field(0.006, description="Her işlem için kâr marjı (0.006 = %0.6)")
+    stop_loss_pct: float = Field(0.01, description="Her işlem için zarar kesme oranı (0.01 = %1)")
     poll_interval_sec: int = Field(5, description="Fiyat kontrol aralığı (saniye)")
 
 
@@ -48,6 +45,8 @@ class GridLevelState(BaseModel):
 class BotState(BaseModel):
     running: bool
     symbol: str
+    base_symbol: str
+    coingecko_id: str
     usdt_balance: float
     coin_balance: float
     realized_pnl_usdt: float
@@ -58,12 +57,73 @@ class BotState(BaseModel):
 
 
 # ==========================
-# GRID BOT IMPLEMENTASYONU
+# YARDIMCI FONKSİYONLAR
+# ==========================
+
+def normalize_base_symbol(symbol: str) -> str:
+    """
+    'BTC/USDT', 'BTCUSDT', 'btcusd', 'BTC' -> 'BTC'
+    """
+    s = symbol.upper()
+    if "/" in s:
+        base = s.split("/")[0]
+    elif s.endswith("USDT"):
+        base = s[:-4]
+    elif s.endswith("USD"):
+        base = s[:-3]
+    else:
+        base = s
+    return base
+
+
+def fetch_coingecko_markets(vs_currency: str = "usd", per_page: int = 250, page: int = 1) -> List[dict]:
+    url = f"{COINGECKO_BASE_URL}/coins/markets"
+    params = {
+        "vs_currency": vs_currency,
+        "order": "market_cap_desc",
+        "per_page": per_page,
+        "page": page,
+        "sparkline": "false"
+    }
+    resp = requests.get(url, params=params, timeout=10)
+    if resp.status_code != 200:
+        raise RuntimeError(f"CoinGecko markets hatası: {resp.status_code} {resp.text}")
+    return resp.json()
+
+
+def find_coingecko_coin_id(base_symbol: str) -> str:
+    """
+    CoinGecko'da 'btc' -> 'bitcoin' gibi id'yi bul.
+    Sembol eşleşmesiyle arıyoruz.
+    """
+    sym_lower = base_symbol.lower()
+    markets = fetch_coingecko_markets()
+    for coin in markets:
+        if coin.get("symbol", "").lower() == sym_lower:
+            return coin["id"]
+    raise ValueError(f"CoinGecko'da '{base_symbol}' için coin bulunamadı.")
+
+
+def fetch_price_from_coingecko(coin_id: str) -> float:
+    url = f"{COINGECKO_BASE_URL}/simple/price"
+    params = {
+        "ids": coin_id,
+        "vs_currencies": "usd",
+    }
+    resp = requests.get(url, params=params, timeout=10)
+    if resp.status_code != 200:
+        raise RuntimeError(f"CoinGecko price hatası: {resp.status_code} {resp.text}")
+    data = resp.json()
+    if coin_id not in data or "usd" not in data[coin_id]:
+        raise RuntimeError(f"CoinGecko price verisi eksik: {data}")
+    return float(data[coin_id]["usd"])
+
+
+# ==========================
+# GRID BOT İÇ YAPISI
 # ==========================
 
 class GridLevel:
-    """Her grid seviyesi için dahili durum."""
-
     def __init__(self, level_price: float):
         self.level_price = level_price
         self.holding: bool = False
@@ -81,39 +141,39 @@ class GridLevel:
 
 class SimGridBot:
     """
-    Gerçek emir YOK, sadece simülasyon.
-    - Belirlenen sembol için public API'den canlı fiyat çeker.
-    - Grid seviyelerine göre:
-        * Fiyat grid seviyesinin altına inerse -> AL (simüle)
-        * Fiyat entry * (1 + take_profit_pct) üzerine çıkarsa -> TP ile SAT (simüle)
-        * Fiyat entry * (1 - stop_loss_pct) altına inerse -> SL ile SAT (simüle)
+    CoinGecko fiyatlarıyla çalışan, tamamen simülasyon grid botu.
+    USDT ~ USD varsayıyoruz.
     """
 
     def __init__(self, config: BotConfig):
         self.config = config
         self.symbol = config.symbol
+        self.base_symbol = normalize_base_symbol(config.symbol)
+
+        # CoinGecko id'yi bul
+        self.coingecko_id = find_coingecko_coin_id(self.base_symbol)
+
+        # Bakiyeler
         self.usdt_balance: float = config.start_usdt
         self.coin_balance: float = 0.0
         self.realized_pnl_usdt: float = 0.0
 
+        # Grid
         self.levels: List[GridLevel] = []
+
+        # Son durum
         self.last_price: Optional[float] = None
         self.last_update_utc: Optional[str] = None
 
+        # Thread / sync
         self._thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
         self._lock = threading.Lock()
         self._running = False
 
-        # Precision bilgisi
-        markets = exchange.load_markets()
-        if self.symbol not in markets:
-            raise ValueError(f"{EXCHANGE_ID} üzerinde {self.symbol} marketi bulunamadı.")
-
-        market = markets[self.symbol]
-        self.amount_prec = market.get("precision", {}).get("amount", 6)
-        self.price_prec = market.get("precision", {}).get("price", 2)
-        self.min_amount = market.get("limits", {}).get("amount", {}).get("min", 0.0)
+        # Precision ve min_amount simülasyon için sabit (coin mantığı)
+        self.amount_prec = 8
+        self.min_amount = 10 ** -self.amount_prec  # çok küçük bir miktar
 
     # ---------- Yardımcı ----------
 
@@ -121,13 +181,8 @@ class SimGridBot:
         factor = 10 ** self.amount_prec
         return math.floor(amount * factor) / factor
 
-    def _round_price(self, price: float) -> float:
-        factor = 10 ** self.price_prec
-        return math.floor(price * factor) / factor
-
     def _fetch_price(self) -> float:
-        ticker = exchange.fetch_ticker(self.symbol)
-        return float(ticker["last"])
+        return fetch_price_from_coingecko(self.coingecko_id)
 
     def _build_grid(self):
         center = self._fetch_price()
@@ -138,25 +193,25 @@ class SimGridBot:
         levels: List[GridLevel] = []
         for i in range(self.config.num_grids + 1):
             lvl_price = low + i * step
-            lvl_price = self._round_price(lvl_price)
             levels.append(GridLevel(lvl_price))
 
-        self.levels = levels
-        self.last_price = center
-        self.last_update_utc = datetime.utcnow().isoformat()
-        print(f"[GRID] {self.symbol} grid oluşturuldu. Merkez: {center:.4f}")
+        with self._lock:
+            self.levels = levels
+            self.last_price = center
+            self.last_update_utc = datetime.utcnow().isoformat()
+
+        print(f"[GRID] {self.symbol} ({self.coingecko_id}) grid oluşturuldu. Merkez: {center:.4f}")
         for lvl in levels:
             print(f"  - Level: {lvl.level_price:.4f}")
 
-    # ---------- Al / Sat simülasyon ----------
+    # ---------- BUY / SELL simülasyon ----------
 
     def _handle_buy(self, level: GridLevel, price: float):
         if level.holding:
             return
 
-        # Bu seviyeden ne kadar alacağız?
         size_usdt = min(self.config.usdt_per_order, self.usdt_balance)
-        if size_usdt < 5:  # minimum bir sınır
+        if size_usdt < 5:
             return
 
         raw_amount = size_usdt / price
@@ -165,8 +220,7 @@ class SimGridBot:
             return
 
         cost = amount * price
-        # Fee'yi simülasyon için kaba tahmin (isteğe göre 0 da yapabilirsin)
-        fee = cost * 0.001
+        fee = cost * 0.001  # %0.1 fee simülasyonu
 
         self.usdt_balance -= (cost + fee)
         self.coin_balance += amount
@@ -176,7 +230,7 @@ class SimGridBot:
         level.amount = amount
 
         print(
-            f"[BUY] {self.symbol} | Fiyat={price:.4f}, amount={amount:.6f}, "
+            f"[BUY] {self.symbol} | Fiyat={price:.4f}, amount={amount:.8f}, "
             f"USDT_kalan={self.usdt_balance:.2f}"
         )
 
@@ -201,10 +255,9 @@ class SimGridBot:
 
         print(
             f"[SELL-{reason}] {self.symbol} | Entry={entry:.4f}, Price={price:.4f}, "
-            f"amount={amount:.6f}, TradePnL={pnl:.4f}, TotalPnL={self.realized_pnl_usdt:.4f}"
+            f"amount={amount:.8f}, TradePnL={pnl:.4f}, TotalPnL={self.realized_pnl_usdt:.4f}"
         )
 
-        # Level sıfırla
         level.holding = False
         level.entry_price = None
         level.amount = 0.0
@@ -214,7 +267,7 @@ class SimGridBot:
     def _loop(self):
         self._build_grid()
         self._running = True
-        print(f"[BOT] {self.symbol} için simülasyon başlatıldı.")
+        print(f"[BOT] {self.symbol} ({self.coingecko_id}) için simülasyon başlatıldı.")
 
         while not self._stop_event.is_set():
             try:
@@ -225,13 +278,12 @@ class SimGridBot:
                     self.last_price = price
                     self.last_update_utc = now_utc
 
-                    # Her level için BUY / SELL koşullarını kontrol et
                     for level in self.levels:
-                        # BUY: fiyat bu grid seviyesine eşit/altına indiğinde
+                        # BUY
                         if (not level.holding) and price <= level.level_price:
                             self._handle_buy(level, price)
 
-                        # SELL: pozisyon varsa TP/SL
+                        # SELL (TP / SL)
                         if level.holding and level.entry_price is not None:
                             tp_level = level.entry_price * (1 + self.config.take_profit_pct)
                             sl_level = level.entry_price * (1 - self.config.stop_loss_pct)
@@ -271,6 +323,8 @@ class SimGridBot:
             return BotState(
                 running=self._running,
                 symbol=self.symbol,
+                base_symbol=self.base_symbol,
+                coingecko_id=self.coingecko_id,
                 usdt_balance=self.usdt_balance,
                 coin_balance=self.coin_balance,
                 realized_pnl_usdt=self.realized_pnl_usdt,
@@ -292,19 +346,32 @@ bot_instance: Optional[SimGridBot] = None
 # API ENDPOINT'LERİ
 # ==========================
 
+@app.get("/")
+def root():
+    return {
+        "message": "Sim trading bot backend (CoinGecko) is running.",
+        "endpoints": ["/prices", "/bot/start", "/bot/status", "/bot/stop"]
+    }
+
+
 @app.get("/prices")
 def get_all_prices():
     """
-    Tüm market fiyatlarını döndürür.
-    Mobil uygulama buradan liste çekip, kullanıcıya coin seçtirebilir.
+    CoinGecko'dan top N coin fiyatlarını getirir.
+    Key = base symbol (BTC, ETH, SOL...), value = USD fiyatı
     """
-    tickers = exchange.fetch_tickers()
-    result = {}
-    for sym, t in tickers.items():
-        try:
-            result[sym] = float(t["last"])
-        except Exception:
+    try:
+        markets = fetch_coingecko_markets()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    result: Dict[str, float] = {}
+    for coin in markets:
+        symbol = coin.get("symbol", "").upper()  # "btc"
+        price = coin.get("current_price", None)
+        if price is None:
             continue
+        result[symbol] = float(price)
     return result
 
 
@@ -312,18 +379,24 @@ def get_all_prices():
 def start_bot(config: BotConfig):
     """
     Simülasyon botunu verilen parametrelerle başlat.
-    Eğer daha önce çalışan bir bot varsa durdurup yenisini başlatır.
+    Önce varsa eski botu durdurur.
     """
     global bot_instance
 
-    # Önce varsa eski botu durdur
+    try:
+        new_bot = SimGridBot(config)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    # eski botu durdur
     if bot_instance is not None:
         bot_instance.stop()
 
-    bot_instance = SimGridBot(config)
+    bot_instance = new_bot
     bot_instance.start()
-    # Grid hemen oluşsun diye biraz bekleyelim
-    time.sleep(1)
+    time.sleep(1)  # grid oluşsun
 
     return bot_instance.get_state()
 
@@ -332,29 +405,22 @@ def start_bot(config: BotConfig):
 def bot_status():
     """
     Botun anlık durumunu döndürür.
-    - running
-    - usdt_balance
-    - coin_balance
-    - realized_pnl
-    - last_price
-    - grid seviyeleri vs.
     """
     if bot_instance is None:
-        raise RuntimeError("Bot başlatılmamış. Önce /bot/start çağır.")
-
+        raise HTTPException(status_code=400, detail="Bot başlatılmamış. Önce /bot/start çağır.")
     return bot_instance.get_state()
 
 
 @app.post("/bot/stop")
 def stop_bot():
     """
-    Botu durdurur.
+    Botu durdurur ve final state'i döndürür.
     """
     global bot_instance
     if bot_instance is None:
         return {"status": "no_bot", "message": "Zaten aktif bot yok."}
+
     bot_instance.stop()
     state = bot_instance.get_state()
     bot_instance = None
     return {"status": "stopped", "final_state": state}
-
