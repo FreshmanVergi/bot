@@ -9,13 +9,13 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
 # ==========================
-# COINGECKO AYARLARI
+# COINCAP AYARLARI
 # ==========================
 
-COINGECKO_BASE_URL = "https://api.coingecko.com/api/v3"
+COINCAP_BASE_URL = "https://api.coincap.io/v2"
 
 app = FastAPI(
-    title="Sim Trading Bot Backend (CoinGecko, No API Key)",
+    title="Sim Trading Bot Backend (CoinCap, No API Key)",
     version="1.0.0"
 )
 
@@ -46,7 +46,7 @@ class BotState(BaseModel):
     running: bool
     symbol: str
     base_symbol: str
-    coingecko_id: str
+    coincap_id: str
     usdt_balance: float
     coin_balance: float
     realized_pnl_usdt: float
@@ -76,51 +76,52 @@ def normalize_base_symbol(symbol: str) -> str:
     return base
 
 
-def fetch_coingecko_markets(vs_currency: str = "usd", per_page: int = 250, page: int = 1) -> List[dict]:
-    url = f"{COINGECKO_BASE_URL}/coins/markets"
-    params = {
-        "vs_currency": vs_currency,
-        "order": "market_cap_desc",
-        "per_page": per_page,
-        "page": page,
-        "sparkline": "false"
-    }
-    resp = requests.get(url, params=params, timeout=10)
+def coincap_get(path: str, params: Dict = None) -> dict:
+    url = f"{COINCAP_BASE_URL}{path}"
+    resp = requests.get(url, params=params or {}, timeout=10)
+    if resp.status_code == 429:
+        # Çok agresif olmayalım, küçük bir backoff
+        time.sleep(2)
+        resp = requests.get(url, params=params or {}, timeout=10)
     if resp.status_code != 200:
-        raise RuntimeError(f"CoinGecko markets hatası: {resp.status_code} {resp.text}")
+        raise RuntimeError(f"CoinCap hatası: {resp.status_code} {resp.text}")
     return resp.json()
 
 
-def find_coingecko_coin_id(base_symbol: str) -> str:
+def fetch_coincap_assets(limit: int = 200) -> List[dict]:
     """
-    CoinGecko'da 'btc' -> 'bitcoin' gibi id'yi bul.
-    Sembol eşleşmesiyle arıyoruz.
+    /v2/assets -> { data: [ {id, symbol, priceUsd, ...}, ... ] }
+    """
+    data = coincap_get("/assets", params={"limit": limit})
+    return data.get("data", [])
+
+
+def find_coincap_coin_id(base_symbol: str) -> str:
+    """
+    CoinCap'de 'btc' -> 'bitcoin' gibi id'yi bul.
     """
     sym_lower = base_symbol.lower()
-    markets = fetch_coingecko_markets()
-    for coin in markets:
-        if coin.get("symbol", "").lower() == sym_lower:
-            return coin["id"]
-    raise ValueError(f"CoinGecko'da '{base_symbol}' için coin bulunamadı.")
+    assets = fetch_coincap_assets(limit=500)
+    for asset in assets:
+        if asset.get("symbol", "").lower() == sym_lower:
+            return asset["id"]
+    raise ValueError(f"CoinCap'te '{base_symbol}' için coin bulunamadı.")
 
 
-def fetch_price_from_coingecko(coin_id: str) -> float:
-    url = f"{COINGECKO_BASE_URL}/simple/price"
-    params = {
-        "ids": coin_id,
-        "vs_currencies": "usd",
-    }
-    resp = requests.get(url, params=params, timeout=10)
-    if resp.status_code != 200:
-        raise RuntimeError(f"CoinGecko price hatası: {resp.status_code} {resp.text}")
-    data = resp.json()
-    if coin_id not in data or "usd" not in data[coin_id]:
-        raise RuntimeError(f"CoinGecko price verisi eksik: {data}")
-    return float(data[coin_id]["usd"])
+def fetch_price_from_coincap(asset_id: str) -> float:
+    """
+    /v2/assets/{id} -> { data: { id, priceUsd, ... } }
+    """
+    data = coincap_get(f"/assets/{asset_id}")
+    asset = data.get("data", {})
+    price = asset.get("priceUsd", None)
+    if price is None:
+        raise RuntimeError(f"CoinCap price verisi eksik: {data}")
+    return float(price)
 
 
 # ==========================
-# GRID BOT İÇ YAPISI
+# GRID BOT
 # ==========================
 
 class GridLevel:
@@ -141,7 +142,7 @@ class GridLevel:
 
 class SimGridBot:
     """
-    CoinGecko fiyatlarıyla çalışan, tamamen simülasyon grid botu.
+    CoinCap fiyatlarıyla çalışan, tamamen simülasyon grid botu.
     USDT ~ USD varsayıyoruz.
     """
 
@@ -150,8 +151,8 @@ class SimGridBot:
         self.symbol = config.symbol
         self.base_symbol = normalize_base_symbol(config.symbol)
 
-        # CoinGecko id'yi bul
-        self.coingecko_id = find_coingecko_coin_id(self.base_symbol)
+        # CoinCap id'yi bul
+        self.coincap_id = find_coincap_coin_id(self.base_symbol)
 
         # Bakiyeler
         self.usdt_balance: float = config.start_usdt
@@ -161,7 +162,7 @@ class SimGridBot:
         # Grid
         self.levels: List[GridLevel] = []
 
-        # Son durum
+        # Son fiyat
         self.last_price: Optional[float] = None
         self.last_update_utc: Optional[str] = None
 
@@ -171,9 +172,9 @@ class SimGridBot:
         self._lock = threading.Lock()
         self._running = False
 
-        # Precision ve min_amount simülasyon için sabit (coin mantığı)
+        # Precision ve min_amount (simülasyon için)
         self.amount_prec = 8
-        self.min_amount = 10 ** -self.amount_prec  # çok küçük bir miktar
+        self.min_amount = 10 ** -self.amount_prec
 
     # ---------- Yardımcı ----------
 
@@ -182,7 +183,7 @@ class SimGridBot:
         return math.floor(amount * factor) / factor
 
     def _fetch_price(self) -> float:
-        return fetch_price_from_coingecko(self.coingecko_id)
+        return fetch_price_from_coincap(self.coincap_id)
 
     def _build_grid(self):
         center = self._fetch_price()
@@ -200,7 +201,7 @@ class SimGridBot:
             self.last_price = center
             self.last_update_utc = datetime.utcnow().isoformat()
 
-        print(f"[GRID] {self.symbol} ({self.coingecko_id}) grid oluşturuldu. Merkez: {center:.4f}")
+        print(f"[GRID] {self.symbol} ({self.coincap_id}) grid oluşturuldu. Merkez: {center:.4f}")
         for lvl in levels:
             print(f"  - Level: {lvl.level_price:.4f}")
 
@@ -267,7 +268,7 @@ class SimGridBot:
     def _loop(self):
         self._build_grid()
         self._running = True
-        print(f"[BOT] {self.symbol} ({self.coingecko_id}) için simülasyon başlatıldı.")
+        print(f"[BOT] {self.symbol} ({self.coincap_id}) için simülasyon başlatıldı.")
 
         while not self._stop_event.is_set():
             try:
@@ -306,7 +307,7 @@ class SimGridBot:
         if self._thread and self._thread.is_alive():
             print("[BOT] Zaten çalışıyor.")
             return
-        self._stop_event.clear()
+        self._stop_event.clear
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
 
@@ -324,7 +325,7 @@ class SimGridBot:
                 running=self._running,
                 symbol=self.symbol,
                 base_symbol=self.base_symbol,
-                coingecko_id=self.coingecko_id,
+                coincap_id=self.coincap_id,
                 usdt_balance=self.usdt_balance,
                 coin_balance=self.coin_balance,
                 realized_pnl_usdt=self.realized_pnl_usdt,
@@ -349,7 +350,7 @@ bot_instance: Optional[SimGridBot] = None
 @app.get("/")
 def root():
     return {
-        "message": "Sim trading bot backend (CoinGecko) is running.",
+        "message": "Sim trading bot backend (CoinCap) is running.",
         "endpoints": ["/prices", "/bot/start", "/bot/status", "/bot/stop"]
     }
 
@@ -357,18 +358,18 @@ def root():
 @app.get("/prices")
 def get_all_prices():
     """
-    CoinGecko'dan top N coin fiyatlarını getirir.
+    CoinCap'ten top N coin fiyatlarını getir.
     Key = base symbol (BTC, ETH, SOL...), value = USD fiyatı
     """
     try:
-        markets = fetch_coingecko_markets()
+        assets = fetch_coincap_assets(limit=200)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
     result: Dict[str, float] = {}
-    for coin in markets:
-        symbol = coin.get("symbol", "").upper()  # "btc"
-        price = coin.get("current_price", None)
+    for asset in assets:
+        symbol = asset.get("symbol", "").upper()   # BTC
+        price = asset.get("priceUsd", None)
         if price is None:
             continue
         result[symbol] = float(price)
@@ -390,7 +391,6 @@ def start_bot(config: BotConfig):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-    # eski botu durdur
     if bot_instance is not None:
         bot_instance.stop()
 
